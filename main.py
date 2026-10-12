@@ -42,7 +42,7 @@ def search_knowledge(query):
     for keyword, value in knowledge_base.items():
         if keyword in q:
             return value
-    return None
+    return f"No entry found for '{query}'. Available topics: {', '.join(knowledge_base.keys())}"
 
 def get_weather(location):
     print(f"[Tool Call] get_weather executed for: {location}")
@@ -198,9 +198,11 @@ messages = [
     {
         "role": "system",
         "content": (
-            "You are a helpful assistant. Use tools when needed and chain "
-            "several if a question requires it. Reply in plain text, "
-            "no markdown or LaTeX."
+            "You are a helpful assistant with three tools: calculator, search_knowledge, get_weather. "
+            "Answer using ONLY information returned by tools. "
+            "If the tools don't contain the answer, say you couldn't find it. "
+            "Do not add facts from your own knowledge. "
+            "Reply in plain text, no markdown or LaTeX."
         ),
     }
 ]
