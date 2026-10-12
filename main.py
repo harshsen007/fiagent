@@ -1,4 +1,3 @@
-
 import os
 import json
 import re
@@ -76,82 +75,155 @@ def get_weather(location):
     except Exception as e:
         return f"Error fetching weather data: {e}"
 
-# --- 2. ROUTER & ORCHESTRATOR ---
 
-def query_nvidia_tool_selector(user_input):
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You're an AI assistant tool router.\n"
-                "Decide which tool to use based on the user's intent:\n"
-                "- 'calculator': For mathematical evaluations.\n"
-                "- 'knowledge_search': For looking up internal facts/topics.\n"
-                "- 'weather': For retrieving current weather reports in a specified city/location.\n"
-                "- 'none': For general conversation, greetings, or questions not covered by the tools.\n\n"
-                "Respond ONLY with a valid JSON object matching one of these schemas:\n"
-                '{ "tool": "calculator", "input": "5 * (4 + 3)" }\n'
-                '{ "tool": "knowledge_search", "input": "python" }\n'
-                '{ "tool": "weather", "input": "London" }\n'
-                '{ "tool": "none", "input": "Hello!" }'
-            )
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Evaluate a math expression such as '5 * (4 + 3)'. Use for any arithmetic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "The math expression to evaluate"}
+                },
+                "required": ["expression"],
+            },
         },
-        {"role": "user", "content": user_input}
-    ]
-    
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": "Look up facts in the local knowledge base about topics like python, openai, ai.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The topic or keyword to look up"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name, e.g. 'Indore'"}
+                },
+                "required": ["location"],
+            },
+        },
+    },
+]
+
+TOOL_FUNCTIONS = {
+    "calculator": calculate_expression,
+    "search_knowledge": search_knowledge,
+    "get_weather": get_weather,
+}
+
+def run_tool(name, args):
+    func = TOOL_FUNCTIONS.get(name)
+    if func is None:
+        return f"Error: unknown tool '{name}'"
     try:
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3.5-lightning-30b-a3b",
-            messages=messages,
-            response_format={"type": "json_object"}
-        )
-        print(response)
-        content_string = response.choices[0].message.content
-        tool_call = json.loads(content_string)
-        return tool_call.get("tool"), tool_call.get("input")
-
+        return str(func(**args))
     except Exception as e:
-        print(f"[Error] Tool selector failed: {e}")
-        return "none", user_input
+        return f"Error running {name}: {e}"
 
-def query_nvidia(user_input):
-    tool, tool_input = query_nvidia_tool_selector(user_input)
-    
-    if tool == "calculator":
-        result = calculate_expression(tool_input)
-        return f"The result is: {result}" if result is not None else "I couldn't compute that."
-        
-    elif tool == "knowledge_search":
-        result = search_knowledge(tool_input)
-        return result if result else "I couldn't find relevant information in local knowledge base."
+# --- 2. AGENT LOOP ---
+MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+MAX_STEPS = 5
 
-    elif tool == "weather":
-        return get_weather(tool_input)
-        
-    else:
+def query_nvidia(user_input, messages):
+    messages.append({"role": "user", "content": user_input})
+
+    for step in range(MAX_STEPS):
         response = client.chat.completions.create(
-            model="nvidia/nemotron-3.5-lightning-30b-a3b",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": user_input}
-            ]
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
         )
-        return response.choices[0].message.content
+        msg = response.choices[0].message
+        messages.append(msg)                      # keep the model's turn in history
+
+
+        print(f"\n[Step {step+1}] RAW RESPONSE:\n{response}\n")
+
+        if msg.tool_calls:
+            for call in msg.tool_calls:
+                print(f"[Step {step+1}] DECISION: call {call.function.name} with {call.function.arguments}")
+        else:
+            print(f"[Step {step+1}] DECISION: no tool needed, answering directly")
+
+
+        thought = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+        if thought:
+            print(f"[Step {step+1}] REASONING: {thought}")
+
+        if msg.content and msg.tool_calls:
+            print(f"[Step {step+1}] MODEL SAID: {msg.content}")    
+
+
+        if not msg.tool_calls:                    # no tool requested = final answer
+            return msg.content
+
+        for call in msg.tool_calls:               # model may request several tools at once
+            try:
+                args = json.loads(call.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+            result = run_tool(call.function.name, args)
+            print(f"[Step {step+1}] {call.function.name}({args}) -> {result}")
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,          # ties the result to the request
+                "content": result,
+            })
+        # loop continues: the model now sees the results and decides what's next
+
+    return "Stopped: too many steps."
 
 # --- 3. MAIN LOOP ---
 
+# Created ONCE, outside the loop, so the agent remembers earlier turns
+messages = [
+    {
+        "role": "system",
+        "content": (
+            "You are a helpful assistant. Use tools when needed and chain "
+            "several if a question requires it. Reply in plain text, "
+            "no markdown or LaTeX."
+        ),
+    }
+]
+
 print("Welcome! Ask me anything. Type 'quit' to stop.")
+
 while True:
     try:
-        user_input = input("You: ")
+        user_input = input("\nYou: ")
         if user_input.lower() == "quit":
             print("Agent: Goodbye!")
             break
-        
+
         if not user_input.strip():
             continue
-            
-        print("Agent:", query_nvidia(user_input))
+
+        answer = query_nvidia(user_input, messages)
+
+        print("\n" + "=" * 50)
+        print("Agent:\n")
+        print(answer)
+        print("=" * 50)
+
     except (KeyboardInterrupt, EOFError):
         print("\nAgent: Goodbye!")
         break
